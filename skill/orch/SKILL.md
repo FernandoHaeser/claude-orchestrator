@@ -30,11 +30,12 @@ Start the run detached (it survives closing the window), then open the live map:
 # prints RUN_ID=<id>
 "$ORCH_HOME/orch/open-window.sh" <id>
 ```
-Optional extra args on `run`: `--model sonnet|opus`, `--budget <usd per agent>`. Tell the user the run id, the budget cap (default US$ 2 per agent, 6 agents), and that `orch` in any terminal lists every active session (arrows + enter to attach, `x` to stop).
+The script opens ONE window in the user's current terminal (tmux, Warp, Terminal.app, iTerm2) and never twice for the same run. For any other terminal it opens nothing and prints `orch watch <id>`: relay that line to the user. Do not open windows any other way.
+Optional extra args on `run`: `--model sonnet|opus`, `--budget <usd per agent>`, `--fix-rounds <n>` (default 2, 0 disables the review→fix loop). Tell the user the run id, the budget cap (default US$ 2 per agent, 6 agents), and that `orch` in any terminal lists every active session (arrows + enter to attach, `x` to stop).
 
 ## 6. Wait and review
 Watch for `<project>/.orch/runs/<id>/SUMMARY.md` to exist (`"$ORCH_HOME/orch.sh" ls` shows live status; phase `failed`/`killed` also ends the run). When done:
-- Read SUMMARY.md and the `REVIEW.md` in the integration worktree.
+- The run already did the review→fix loop on its own: blocking findings (blocker/high/medium) went back to the agents that own the files (src→implementer, tests→tester, docs→docs, ADRs→architect) and the reviewer re-ran, up to `--fix-rounds`. Read SUMMARY.md and the final `REVIEW.md` in the integration worktree; say how many rounds ran and whether blocking findings are still open (`unresolved`).
 - Report briefly: verdict, merge conflicts, per-agent status and cost, top review findings.
 
 ## 7. Ask what to do next (mandatory)
@@ -42,7 +43,7 @@ Never merge, commit, push or delete on your own. After the report, ask with AskU
 1. **Merge into current branch** — `git merge --no-ff orch/<id>/integration` in the project (show the diffstat first).
 2. **Push the branch / open a PR** — push `orch/<id>/integration` only after a second explicit confirmation; PR text has no agent attribution footer.
 3. **Keep for manual review** — leave branch and worktree, give the path (`.orch/runs/<id>/wt/integration`).
-4. **Fix review findings first** — start a normal session on the integration worktree.
+4. **Fix remaining findings** (only if some are still open) — start a normal session on the integration worktree, or re-run with a higher `--fix-rounds`.
 5. **Discard** — `"$ORCH_HOME/orch.sh" cleanup <id>` (removes worktrees and `orch/<id>/*` branches; confirm before running).
 
 Commit rules when a commit is needed (agent output is already committed on `orch/*` branches by the orchestrator): author is the user's git identity, no `Co-Authored-By`, and in `~/work/*` the message is `{BRANCH-NAME}-{ACTION}`. After a merge, offer `cleanup` (and push, as a separate question).

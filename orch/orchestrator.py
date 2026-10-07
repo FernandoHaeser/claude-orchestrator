@@ -177,6 +177,15 @@ async def run_fake(agent: Agent, speed: float) -> None:
         agent.activity = step
         agent.cost_usd += 0.013
         await asyncio.sleep(speed * (0.6 + 0.2 * (len(agent.role) % 5)))
+    if agent.role.startswith("reviewer"):
+        rnd = int(agent.role.split("-r")[1]) if "-r" in agent.role else 1
+        findings = [] if rnd > 1 else [
+            {"path": "src/app.py", "line": 12, "severity": "high", "problem": "unvalidated input", "fix": "validate"},
+            {"path": "tests/test_app.py", "line": 3, "severity": "medium", "problem": "no failure-path test", "fix": "add one"}]
+        (agent.workdir / "REVIEW.json").write_text(json.dumps({"verdict": "fix" if findings else "ship", "findings": findings}))
+        (agent.workdir / "REVIEW.md").write_text(f"# Review (round {rnd})\n")
+    elif "-fix" in agent.role:
+        (agent.workdir / f"FIXED_{agent.role}.txt").write_text("dry-run fix\n")
     agent.report = f"[dry-run] {agent.role} finished."
     agent.status, agent.activity, agent.ended = "done", "finished", time.time()
 
@@ -247,6 +256,7 @@ def render_map(phase: str, lead: Agent, w1: list[Agent], w2: list[Agent], width:
     lead_w, merge_w, rev_w = 20, 12, 22
     g1, g2, g3 = 7, 11, 5
     agent_w = max(18, min(36, width - (lead_w + merge_w + rev_w + g1 + g2 + g3)))
+    reviews = [a for a in w2 if a.role.startswith("reviewer")]
     node_h, gap, n = 4, 1, len(w1)
     height = n * node_h + (n - 1) * gap
     xa = lead_w + g1
@@ -262,7 +272,14 @@ def render_map(phase: str, lead: Agent, w1: list[Agent], w2: list[Agent], width:
     order = sorted(range(n), key=lambda i: LINK_RANK[w1[i].status])  # worst/most-advanced drawn last
 
     # fan-out: lead -> bus -> agents
-    merge_state = "done" if phase in ("wave 2: review", "done") else ("running" if phase == "merge" else "queued")
+    if phase in ("plan", "wave 1: parallel"):
+        merge_state = "queued"
+    elif phase == "merge":
+        merge_state = "running"
+    elif phase in ("failed", "killed"):
+        merge_state = "done" if stage_status(phase, w1) == "done" else "queued"
+    else:
+        merge_state = "done"
     best = w1[order[-1]].status
     c.hline(lead_w, bus1 - 1, mid, LINK_STYLE[lead.status], hz(lead.status))
     for i in order:
@@ -292,13 +309,15 @@ def render_map(phase: str, lead: Agent, w1: list[Agent], w2: list[Agent], width:
     # merge -> reviewer
     c.hline(xm + merge_w, xr - 2, mid, LINK_STYLE[merge_state], hz(merge_state))
     c.put(xr - 1, mid, "▶", LINK_STYLE[merge_state])
+    if len(reviews) > 1:
+        c.put(xm + merge_w + 1, mid, f" r{len(reviews)} ", "bold yellow")
 
     # nodes drawn last so they sit on top of links
     c.node(0, mid - 1, lead_w, "lead", lead.status, f"{lead.elapsed:.0f}s", "planner (opus)")
     for i, a in enumerate(w1):
         c.node(xa, rows[i] - 1, agent_w, a.role, a.status, f"{a.tool_calls}t {a.elapsed:.0f}s", a.activity)
     c.node(xm, mid - 1, merge_w, "merge", merge_state, "", "git")
-    rev = w2[0]
+    rev = reviews[-1]
     c.node(xr, mid - 1, rev_w, rev.role, rev.status, f"{rev.tool_calls}t {rev.elapsed:.0f}s", rev.activity)
     return c.to_text()
 
@@ -379,39 +398,106 @@ def worker_prompt(agent: Agent, task: str, contract: str, context: Path) -> str:
             f"# Your task\n{task}\n\n# CONTRACT.md\n{contract}\n\n# Shared context\n{context.read_text()}")
 
 
-async def wave(args, agents: list[Agent], plan: dict, context: Path, project: Path, run_dir: Path, run_id: str, base: str) -> None:
+async def wave(args, agents: list[Agent], contract: str, tasks: dict[str, str], context: Path, project: Path,
+                run_dir: Path, run_id: str, base: str) -> None:
+    """Run agents in parallel, each in its own worktree branched from `base`."""
     async def one(agent: Agent) -> None:
         agent.workdir = make_worktree(project, run_dir, run_id, agent.role, base)
-        (agent.workdir / "CONTRACT.md").write_text(plan["contract"])
+        (agent.workdir / "CONTRACT.md").write_text(contract)
         if args.dry_run:
             await run_fake(agent, args.speed)
             return
         system = f"You are the {agent.role} agent. Own only: {agent.owns}. Do not git commit."
         cmd = claude_cmd(args.model, agent.tools, system, args.budget, "acceptEdits")
-        await run_process(agent, cmd, worker_prompt(agent, plan["tasks"][agent.role], plan["contract"], context), agent.workdir)
+        await run_process(agent, cmd, worker_prompt(agent, tasks[agent.role], contract, context), agent.workdir)
 
     await asyncio.gather(*(one(a) for a in agents))
 
 
-def commit_and_merge(project: Path, run_dir: Path, run_id: str, agents: list[Agent], base: str) -> tuple[str, list[str]]:
-    """Commit each agent's worktree, merge all into an integration branch."""
-    for a in agents:
-        if a.status == "done":
-            git(a.workdir, "add", "-A")
-            git(a.workdir, "commit", "-q", "--allow-empty", "-m", f"{a.role}: agent output")
-    integ = f"orch/{run_id}/integration"
-    path = run_dir / "wt" / "integration"
-    git(project, "worktree", "add", "-q", "-b", integ, str(path), base)
+def merge_agents(run_dir: Path, run_id: str, agents: list[Agent], label: str = "agent output") -> list[str]:
+    """Commit each finished agent's worktree and merge its branch into the integration worktree."""
+    integ_path = run_dir / "wt" / "integration"
     conflicts: list[str] = []
     for a in agents:
         if a.status != "done":
             continue
+        git(a.workdir, "add", "-A")
+        git(a.workdir, "commit", "-q", "--allow-empty", "-m", f"{a.role}: {label}")
         try:
-            git(path, "merge", "-q", "--no-ff", "-m", f"merge {a.role}", f"orch/{run_id}/{a.role}")
+            git(integ_path, "merge", "-q", "--no-ff", "-m", f"merge {a.role}", f"orch/{run_id}/{a.role}")
         except RuntimeError:
-            git(path, "merge", "--abort")
+            git(integ_path, "merge", "--abort")
             conflicts.append(a.role)
-    return integ, conflicts
+    return conflicts
+
+
+def commit_and_merge(project: Path, run_dir: Path, run_id: str, agents: list[Agent], base: str) -> tuple[str, list[str]]:
+    """Create the integration branch/worktree and merge the first wave into it."""
+    integ = f"orch/{run_id}/integration"
+    git(project, "worktree", "add", "-q", "-b", integ, str(run_dir / "wt" / "integration"), base)
+    return integ, merge_agents(run_dir, run_id, agents)
+
+
+# --------------------------------------------------------------------------- review -> fix loop
+OWNERSHIP = [("docs/adr/", "architect"), ("tests/", "tester"), ("test/", "tester"),
+             ("docs/", "docs"), ("README", "docs"), ("src/", "implementer")]
+BLOCKING = {"blocker", "high", "medium"}
+
+
+def owner_of(path: str) -> str:
+    clean = path.lstrip("./")
+    return next((role for prefix, role in OWNERSHIP if clean.startswith(prefix)), "implementer")
+
+
+def read_review(workdir: Path) -> dict | None:
+    try:
+        return json.loads((workdir / "REVIEW.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def blocking_findings(review: dict | None) -> list[dict]:
+    return [f for f in (review or {}).get("findings", []) if str(f.get("severity", "")).lower() in BLOCKING]
+
+
+def fix_task(findings: list[dict]) -> str:
+    lines = [f"- {f.get('path', '?')}:{f.get('line', '?')} [{f.get('severity')}] {f.get('problem', '')} -> {f.get('fix', '')}"
+             for f in findings]
+    return ("Fix ONLY these review findings, in files you own. Do not refactor anything else. "
+            "If a finding belongs to a file you do not own, say so in your report.\n" + "\n".join(lines))
+
+
+async def fix_loop(args, ctl: dict, everyone: list[Agent], reviewer: Agent, plan: dict, context: Path,
+                   project: Path, run_dir: Path, run_id: str, integ: str) -> tuple[Agent, list[str]]:
+    """review -> owners fix -> re-review, up to args.fix_rounds. Returns the last reviewer and merge conflicts."""
+    conflicts: list[str] = []
+    for rnd in range(1, args.fix_rounds + 1):
+        todo = blocking_findings(read_review(reviewer.workdir)) if reviewer.status == "done" else []
+        if not todo:
+            break
+        by_owner: dict[str, list[dict]] = {}
+        for f in todo:
+            by_owner.setdefault(owner_of(str(f.get("path", ""))), []).append(f)
+        fixers = []
+        for role in by_owner:
+            fx = load_agent(role)
+            fx.role = f"{role}-fix{rnd}"
+            fixers.append(fx)
+        everyone.extend(fixers)
+        ctl["phase"] = f"fix round {rnd}"
+        tasks = {fx.role: fix_task(by_owner[fx.role.rsplit("-fix", 1)[0]]) for fx in fixers}
+        await wave(args, fixers, plan["contract"], tasks, context, project, run_dir, run_id, integ)
+        conflicts += merge_agents(run_dir, run_id, fixers, "review fixes")
+
+        ctl["phase"] = f"re-review {rnd}"
+        reviewer = load_agent("reviewer")
+        reviewer.role = f"reviewer-r{rnd + 1}"
+        everyone.append(reviewer)
+        task = (plan["tasks"]["reviewer"] + f"\n\nThis is re-review round {rnd + 1}. Verify the previous findings are fixed, "
+                "look for regressions, then rewrite REVIEW.md and REVIEW.json from scratch.")
+        await wave(args, [reviewer], plan["contract"], {reviewer.role: task}, context, project, run_dir, run_id, integ)
+        conflicts += merge_agents(run_dir, run_id, [reviewer], "re-review")
+    return reviewer, conflicts
 
 
 def snapshot(run_id: str, project: Path, ctl: dict, note: str, agents: list[Agent], started: float) -> dict:
@@ -419,6 +505,7 @@ def snapshot(run_id: str, project: Path, ctl: dict, note: str, agents: list[Agen
     return {
         "run_id": run_id, "project": str(project), "phase": ctl["phase"], "note": note,
         "finished": ctl["finished"], "error": ctl["error"], "integration": ctl["integration"],
+        "unresolved": ctl.get("unresolved", 0),
         "pid": os.getpid(), "started": started, "updated": time.time(),
         "agents": [{"role": a.role, "status": a.status, "activity": a.activity, "tool_calls": a.tool_calls,
                     "cost_usd": a.cost_usd, "started": a.started, "ended": a.ended} for a in agents],
@@ -460,7 +547,7 @@ async def main_async(args) -> int:
     w2 = [load_agent(r) for r in WAVE_2]
     everyone = [lead, *w1, *w2]
     note = f"project: {project.name}  model: {args.model}{'  DRY-RUN' if args.dry_run else ''}"
-    ctl = {"phase": "plan", "finished": False, "error": None, "integration": None}
+    ctl = {"phase": "plan", "finished": False, "error": None, "integration": None, "unresolved": 0}
     started = time.time()
     state.register(run_id, project, run_dir, brief)
 
@@ -494,17 +581,17 @@ async def main_async(args) -> int:
             if lead.status == "failed":
                 raise RuntimeError("planning failed")
             ctl["phase"] = "wave 1: parallel"
-            await wave(args, w1, plan, context, project, run_dir, run_id, base)
+            await wave(args, w1, plan["contract"], plan["tasks"], context, project, run_dir, run_id, base)
             ctl["phase"] = "merge"
             integ, conflicts = commit_and_merge(project, run_dir, run_id, w1, base)
             ctl["integration"] = integ
             ctl["phase"] = "wave 2: review"
-            await wave(args, w2, plan, context, project, run_dir, run_id, integ)
-            for a in w2:
-                if a.status == "done":
-                    git(a.workdir, "add", "-A")
-                    git(a.workdir, "commit", "-q", "--allow-empty", "-m", "reviewer: REVIEW.md")
-                    git(run_dir / "wt" / "integration", "merge", "-q", "--no-ff", "-m", "merge reviewer", f"orch/{run_id}/reviewer")
+            await wave(args, w2, plan["contract"], plan["tasks"], context, project, run_dir, run_id, integ)
+            conflicts += merge_agents(run_dir, run_id, w2, "review")
+            last_reviewer, more = await fix_loop(args, ctl, everyone, w2[0], plan, context, project, run_dir, run_id, integ)
+            conflicts += more
+            if last_reviewer.status == "done":
+                ctl["unresolved"] = len(blocking_findings(read_review(last_reviewer.workdir)))
             ctl["phase"] = "done"
         except Exception as exc:  # noqa: BLE001 - surface any failure in state, not just a traceback
             ctl.update(phase="failed", error=f"{type(exc).__name__}: {exc}")
@@ -523,7 +610,9 @@ async def main_async(args) -> int:
         summary.append(f"Integration branch: `{ctl['integration']}` (worktree: `.orch/runs/{run_id}/wt/integration`)\n")
     if conflicts:
         summary.append(f"Merge conflicts (resolve manually): {', '.join(conflicts)}\n")
-    for a in [lead, *w1, *w2]:
+    if ctl["unresolved"]:
+        summary.append(f"**{ctl['unresolved']} blocking finding(s) still open after {args.fix_rounds} fix round(s)**: see REVIEW.md in the integration worktree.\n")
+    for a in everyone:
         summary.append(f"## {a.role} [{a.status}] ${a.cost_usd:.3f}\n\n{a.report}\n")
     (run_dir / "SUMMARY.md").write_text("\n".join(summary))
     if not args.headless:
@@ -538,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="sonnet")
     p.add_argument("--lead-model", default="opus")
     p.add_argument("--budget", type=float, default=2.0, help="max USD per agent")
+    p.add_argument("--fix-rounds", type=int, default=2, help="max review->fix->re-review rounds (0 disables)")
     p.add_argument("--view", choices=["map", "table", "both"], default="both")
     p.add_argument("--dry-run", action="store_true", help="simulate agents, spend nothing")
     p.add_argument("--speed", type=float, default=0.8, help="dry-run step delay in seconds")
